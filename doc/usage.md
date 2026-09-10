@@ -255,10 +255,19 @@ This adds a NVMe device to the VM which will be backed by the disk image at `/Us
 
 #### Description
 
-The `--device usb-mass-storage` option adds a USB mass storage device to the virtual machine. The disk is backed by an image file on the host machine. This file is a raw image file or an ISO image.
+The `--device usb-mass-storage` option adds a USB mass storage device to the
+virtual machine. The disk can be backed by a raw or ISO image on the host, or
+by an NBD export. Unlike runtime USB storage hotplug, this device is present in
+the virtual machine configuration before the guest starts and does not require
+`--device usb-xhci`.
 
 #### Arguments
-- `path`: the absolute path to the disk image file.
+- `path`: the absolute path to the disk image file. Exactly one of `path` or
+  `uri` is required.
+- `uri`: the URI of the NBD export. It accepts the same `nbd`, `nbds`,
+  `nbd+unix`, and `nbds+unix` schemes as `--device nbd`.
+- `timeout`: NBD connection timeout in milliseconds. The default is 15000.
+- `sync`: NBD synchronization mode, either `full` (the default) or `none`.
 - `readonly`: if specified the device will be read only.
 
 #### Example
@@ -266,6 +275,12 @@ The `--device usb-mass-storage` option adds a USB mass storage device to the vir
 This adds a read only USB mass storage device to the VM which will be backed by the ISO image at `/Users/virtuser/distro.iso`:
 ```
 --device usb-mass-storage,path=/Users/virtuser/distro.iso,readonly
+```
+
+This adds a writable NBD export as USB mass storage before the guest starts:
+
+```
+--device usb-mass-storage,uri=nbd://192.168.64.4:10809/persistent,timeout=60000,sync=full
 ```
 
 ### Network Block Device

@@ -35,6 +35,12 @@ type vzNetworkBlockDevice struct {
 	config *NetworkBlockDevice
 }
 
+type vzUSBNetworkBlockDevice struct {
+	*vz.USBMassStorageDeviceConfiguration
+	config     *USBMassStorage
+	attachment *vz.NetworkBlockDeviceStorageDeviceAttachment
+}
+
 func (dev *NVMExpressController) toVz() (vz.StorageDeviceConfiguration, error) {
 	var storageConfig = DiskStorageConfig(dev.DiskStorageConfig)
 	attachment, err := storageConfig.toVz()
@@ -428,26 +434,41 @@ func (dev *NetworkBlockDevice) AddToVirtualMachineConfig(vmConfig *VirtualMachin
 
 func ListenNetworkBlockDevices(vm *VirtualMachine) error {
 	for _, dev := range vm.vfConfig.storageDevicesConfiguration {
-		if nbdDev, isNbdDev := dev.(vzNetworkBlockDevice); isNbdDev {
+		switch nbdDev := dev.(type) {
+		case vzNetworkBlockDevice:
 			nbdAttachment, isNbdAttachment := dev.Attachment().(*vz.NetworkBlockDeviceStorageDeviceAttachment)
 			if !isNbdAttachment {
 				log.Info("Found NBD device with no NBD attachment. Please file a vfkit bug.")
 				return fmt.Errorf("NetworkBlockDevice must use a NBD attachment")
 			}
-			nbdConfig := nbdDev.config
-			go func() {
-				for {
-					select {
-					case err := <-nbdAttachment.DidEncounterError():
-						log.Infof("Disconnected from NBD server %s. Error %v", nbdConfig.URI, err.Error())
-					case <-nbdAttachment.Connected():
-						log.Infof("Successfully connected to NBD server %s.", nbdConfig.URI)
-					}
-				}
-			}()
+			monitorNetworkBlockDevice(
+				nbdAttachment,
+				fmt.Sprintf("NBD server %s", nbdDev.config.URI),
+			)
+		case vzUSBNetworkBlockDevice:
+			monitorNetworkBlockDevice(
+				nbdDev.attachment,
+				"NBD-backed USB storage device",
+			)
 		}
 	}
 	return nil
+}
+
+func monitorNetworkBlockDevice(
+	attachment *vz.NetworkBlockDeviceStorageDeviceAttachment,
+	description string,
+) {
+	go func() {
+		for {
+			select {
+			case err := <-attachment.DidEncounterError():
+				log.Infof("Disconnected from %s. Error %v", description, err.Error())
+			case <-attachment.Connected():
+				log.Infof("Successfully connected to %s.", description)
+			}
+		}
+	}()
 }
 
 func AddToVirtualMachineConfig(vmConfig *VirtualMachineConfiguration, dev config.VirtioDevice) error {
@@ -537,6 +558,30 @@ func (conf *DiskStorageConfig) toVz() (vz.StorageDeviceAttachment, error) {
 }
 
 func (dev *USBMassStorage) toVz() (vz.StorageDeviceConfiguration, error) {
+	if err := (*config.USBMassStorage)(dev).Validate(); err != nil {
+		return nil, err
+	}
+	if dev.URI != "" {
+		attachment, err := vz.NewNetworkBlockDeviceStorageDeviceAttachment(
+			dev.URI,
+			dev.Timeout,
+			dev.ReadOnly,
+			nbdSynchronizationModeVZ(dev.SynchronizationMode),
+		)
+		if err != nil {
+			return nil, err
+		}
+		configuration, err := vz.NewUSBMassStorageDeviceConfiguration(attachment)
+		if err != nil {
+			return nil, err
+		}
+		return vzUSBNetworkBlockDevice{
+			USBMassStorageDeviceConfiguration: configuration,
+			config:                            dev,
+			attachment:                        attachment,
+		}, nil
+	}
+
 	var storageConfig = DiskStorageConfig(dev.DiskStorageConfig)
 	attachment, err := storageConfig.toVz()
 	if err != nil {
@@ -550,7 +595,11 @@ func (dev *USBMassStorage) AddToVirtualMachineConfig(vmConfig *VirtualMachineCon
 	if err != nil {
 		return err
 	}
-	log.Infof("Adding USB mass storage device (imagePath: %s)", dev.ImagePath)
+	if dev.URI != "" {
+		log.Info("Adding NBD-backed USB mass storage device")
+	} else {
+		log.Infof("Adding USB mass storage device (imagePath: %s)", dev.ImagePath)
+	}
 	vmConfig.storageDevicesConfiguration = append(vmConfig.storageDevicesConfiguration, storageDeviceConfig)
 
 	return nil

@@ -294,8 +294,34 @@ var jsonStabilityTests = map[string]jsonStabilityTest{
 			usb.Type = DiskBackendImage
 			return usb
 		},
-		skipFields:   []string{"DevName", "URI", "Type"},
+		skipFields: []string{
+			"DevName",
+			"URI",
+			"Timeout",
+			"SynchronizationMode",
+			"Type",
+		},
 		expectedJSON: `{"kind":"usbmassstorage","devName":"usb-mass-storage","imagePath":"ImagePath","readOnly":true,"type":"image"}`,
+	},
+	"USBMassStorageNBD": {
+		newObjectFunc: func(t *testing.T) any {
+			usb, err := USBMassStorageNBDNew(
+				"nbd://192.0.2.10:10809/persistent",
+				1000,
+				SynchronizationFullMode,
+			)
+			require.NoError(t, err)
+			return usb
+		},
+		skipFields: []string{
+			"DevName",
+			"ImagePath",
+			"Type",
+			"URI",
+			"Timeout",
+			"SynchronizationMode",
+		},
+		expectedJSON: `{"kind":"usbmassstorage","devName":"usb-mass-storage","readOnly":true,"uri":"nbd://192.0.2.10:10809/persistent","timeout":1000000000,"synchronizationMode":"full"}`,
 	},
 	"USBXHCIController": {
 		obj:          &USBXHCIController{},

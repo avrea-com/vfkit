@@ -322,6 +322,27 @@ func TestVirtioDevices(t *testing.T) {
 			},
 			expectedCmdLine: []string{"--device", "usb-mass-storage,path=/foo/bar,readonly"},
 		},
+		"NewUSBMassStorageNBD": {
+			newDev: func() (VirtioDevice, error) {
+				return USBMassStorageNBDNew(
+					"nbd://192.0.2.10:10809/persistent",
+					1000,
+					SynchronizationNoneMode,
+				)
+			},
+			expectedDev: &USBMassStorage{
+				DiskStorageConfig: DiskStorageConfig{
+					StorageConfig: StorageConfig{DevName: "usb-mass-storage"},
+				},
+				URI:                 "nbd://192.0.2.10:10809/persistent",
+				Timeout:             time.Second,
+				SynchronizationMode: SynchronizationNoneMode,
+			},
+			expectedCmdLine: []string{
+				"--device",
+				"usb-mass-storage,uri=nbd://192.0.2.10:10809/persistent,timeout=1000,sync=none",
+			},
+		},
 		"NewVirtioInputWithPointingDevice": {
 			newDev: func() (VirtioDevice, error) { return VirtioInputNew("pointing") },
 			expectedDev: &VirtioInput{
@@ -523,6 +544,51 @@ func TestValidateNBDURI(t *testing.T) {
 		require.Error(t, err, uri)
 		assert.Contains(t, err.Error(), message, uri)
 	}
+}
+
+func TestUSBMassStorageNBDDefaults(t *testing.T) {
+	dev, err := deviceFromCmdLine(
+		"usb-mass-storage,uri=nbd://192.0.2.10:10809/persistent",
+	)
+	require.NoError(t, err)
+
+	usb, ok := dev.(*USBMassStorage)
+	require.True(t, ok)
+	assert.Equal(t, DefaultNBDTimeout, usb.Timeout)
+	assert.Equal(t, SynchronizationFullMode, usb.SynchronizationMode)
+	assert.Equal(
+		t,
+		[]string{
+			"--device",
+			"usb-mass-storage,uri=nbd://192.0.2.10:10809/persistent,timeout=15000,sync=full",
+		},
+		mustDeviceCmdLine(t, usb),
+	)
+}
+
+func TestUSBMassStorageRejectsInvalidNBDConfigurations(t *testing.T) {
+	tests := map[string]string{
+		"usb-mass-storage,path=/tmp/disk.raw,uri=nbd://192.0.2.10/export": "exactly one of 'path' or 'uri'",
+		"usb-mass-storage,uri=https://192.0.2.10/export":                  "invalid USB mass-storage NBD 'uri'",
+		"usb-mass-storage,uri=nbd://192.0.2.10/export,type=dev":           "'type' is not supported with 'uri'",
+		"usb-mass-storage,path=/tmp/disk.raw,timeout=1000":                "NBD options require 'uri'",
+		"usb-mass-storage,uri=nbd://192.0.2.10/export,timeout=-1":         "'timeout' must be greater than zero",
+		"usb-mass-storage,uri=nbd://192.0.2.10/export,timeout=0":          "'timeout' must be greater than zero",
+	}
+
+	for commandLine, message := range tests {
+		t.Run(commandLine, func(t *testing.T) {
+			_, err := deviceFromCmdLine(commandLine)
+			require.ErrorContains(t, err, message)
+		})
+	}
+}
+
+func mustDeviceCmdLine(t *testing.T, dev VirtioDevice) []string {
+	t.Helper()
+	commandLine, err := dev.ToCmdLine()
+	require.NoError(t, err)
+	return commandLine
 }
 
 func TestParseNBDSynchronizationMode(t *testing.T) {

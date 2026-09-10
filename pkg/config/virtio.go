@@ -965,6 +965,9 @@ func (nbd *NetworkBlockDevice) FromOptions(options []option) error {
 
 type USBMassStorage struct {
 	DiskStorageConfig
+	URI                 string                 `json:"uri,omitempty"`
+	Timeout             time.Duration          `json:"timeout,omitempty"`
+	SynchronizationMode NBDSynchronizationMode `json:"synchronizationMode,omitempty"`
 }
 
 func usbMassStorageNewEmpty() *USBMassStorage {
@@ -984,6 +987,128 @@ func USBMassStorageNew(imagePath string) (*USBMassStorage, error) {
 	usbMassStorage.ImagePath = imagePath
 
 	return usbMassStorage, nil
+}
+
+// USBMassStorageNBDNew creates a boot-time USB disk backed by a remote NBD
+// export.
+func USBMassStorageNBDNew(
+	uri string,
+	timeout uint32,
+	synchronization NBDSynchronizationMode,
+) (*USBMassStorage, error) {
+	usbMassStorage := usbMassStorageNewEmpty()
+	usbMassStorage.URI = uri
+	usbMassStorage.Timeout = time.Duration(timeout) * time.Millisecond
+	usbMassStorage.SynchronizationMode = synchronization
+
+	return usbMassStorage, nil
+}
+
+// Validate checks that the USB disk has exactly one supported backing store
+// and that any NBD-specific options are usable by Virtualization.framework.
+func (dev *USBMassStorage) Validate() error {
+	hasPath := dev.ImagePath != ""
+	hasURI := dev.URI != ""
+	if hasPath == hasURI {
+		return fmt.Errorf("usb-mass-storage devices need exactly one of 'path' or 'uri'")
+	}
+	if hasPath {
+		if dev.Timeout != 0 || dev.SynchronizationMode != "" {
+			return fmt.Errorf("usb-mass-storage NBD options require 'uri'")
+		}
+		return nil
+	}
+	if dev.Type != DiskBackendDefault {
+		return fmt.Errorf("usb-mass-storage 'type' is not supported with 'uri'")
+	}
+	if err := ValidateNBDURI(dev.URI); err != nil {
+		return fmt.Errorf("invalid USB mass-storage NBD 'uri': %w", err)
+	}
+	if dev.Timeout <= 0 {
+		return fmt.Errorf("usb-mass-storage NBD 'timeout' must be greater than zero")
+	}
+	if dev.SynchronizationMode != SynchronizationFullMode &&
+		dev.SynchronizationMode != SynchronizationNoneMode {
+		return fmt.Errorf(
+			"invalid sync mode: %s, must be 'full' or 'none'",
+			dev.SynchronizationMode,
+		)
+	}
+	return nil
+}
+
+func (dev *USBMassStorage) ToCmdLine() ([]string, error) {
+	if err := dev.Validate(); err != nil {
+		return nil, err
+	}
+	if dev.URI == "" {
+		return dev.DiskStorageConfig.ToCmdLine()
+	}
+
+	value := fmt.Sprintf(
+		"usb-mass-storage,uri=%s,timeout=%d,sync=%s",
+		dev.URI,
+		dev.Timeout.Milliseconds(),
+		dev.SynchronizationMode,
+	)
+	if dev.ReadOnly {
+		value += ",readonly"
+	}
+	return []string{"--device", value}, nil
+}
+
+func (dev *USBMassStorage) FromOptions(options []option) error {
+	nbdOption := false
+	timeoutOption := false
+	for _, option := range options {
+		switch option.key {
+		case "path":
+			dev.ImagePath = option.value
+		case "type":
+			typ := DiskBackendType(option.value)
+			if !typ.IsValid() {
+				return fmt.Errorf("unexpected value for disk 'type' option: %s", option.value)
+			}
+			dev.Type = typ
+		case "uri":
+			dev.URI = option.value
+			nbdOption = true
+		case "timeout":
+			timeoutMS, err := strconv.ParseInt(option.value, 10, 32)
+			if err != nil {
+				return err
+			}
+			dev.Timeout = time.Duration(timeoutMS) * time.Millisecond
+			nbdOption = true
+			timeoutOption = true
+		case "sync":
+			mode, err := ParseNBDSynchronizationMode(option.value)
+			if err != nil {
+				return err
+			}
+			dev.SynchronizationMode = mode
+			nbdOption = true
+		case "readonly":
+			if option.value != "" {
+				return fmt.Errorf(
+					"unexpected value for usb-mass-storage 'readonly' option: %s",
+					option.value,
+				)
+			}
+			dev.ReadOnly = true
+		default:
+			return fmt.Errorf("unknown option for usb-mass-storage devices: %s", option.key)
+		}
+	}
+	if nbdOption {
+		if !timeoutOption {
+			dev.Timeout = DefaultNBDTimeout
+		}
+		if dev.SynchronizationMode == "" {
+			dev.SynchronizationMode = SynchronizationFullMode
+		}
+	}
+	return dev.Validate()
 }
 
 func (dev *USBMassStorage) SetReadOnly(readOnly bool) {
