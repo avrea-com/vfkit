@@ -53,7 +53,7 @@ func AddFlags(cmd *cobra.Command, opts *Options) {
 	cmd.Flags().UintVarP(&opts.MemoryMiB, "memory", "m", 512, "virtual machine RAM size in mibibytes")
 
 	cmd.Flags().StringVarP(&opts.TimeSync, "timesync", "t", "", "sync guest time when host wakes up from sleep")
-	cmd.Flags().StringArrayVarP(&opts.Devices, "device", "d", []string{}, "devices")
+	cmd.Flags().StringArrayVarP(&opts.Devices, "device", "d", []string{}, "devices (virtio-blk: sync=full|fsync|none, cache=automatic|cached|uncached)")
 
 	cmd.Flags().StringVar(&opts.LogLevel, "log-level", "", "set log level")
 	cmd.Flags().StringVar(&opts.RestfulURI, "restful-uri", DefaultRestfulURI, "URI address for RESTful services")
