@@ -736,6 +736,17 @@ func (dev *VirtioBlk) ToCmdLine() ([]string, error) {
 }
 
 func (dev *VirtioBlk) validate() error {
+	// First validate the disk storage config (cache/sync mode constraints)
+	if err := dev.DiskStorageConfig.validate(); err != nil {
+		return err
+	}
+
+	// Skip qcow2 check for block devices (they can't be qcow2 format)
+	if dev.Type == DiskBackendBlockDevice {
+		return nil
+	}
+
+	// Then check for qcow2 images (only for disk image files)
 	imgPath := dev.ImagePath
 	file, err := os.Open(imgPath)
 	if err != nil {
@@ -965,9 +976,8 @@ func (nbd *NetworkBlockDevice) FromOptions(options []option) error {
 
 type USBMassStorage struct {
 	DiskStorageConfig
-	URI                 string                 `json:"uri,omitempty"`
-	Timeout             time.Duration          `json:"timeout,omitempty"`
-	SynchronizationMode NBDSynchronizationMode `json:"synchronizationMode,omitempty"`
+	URI     string        `json:"uri,omitempty"`
+	Timeout time.Duration `json:"timeout,omitempty"`
 }
 
 func usbMassStorageNewEmpty() *USBMassStorage {
@@ -999,7 +1009,7 @@ func USBMassStorageNBDNew(
 	usbMassStorage := usbMassStorageNewEmpty()
 	usbMassStorage.URI = uri
 	usbMassStorage.Timeout = time.Duration(timeout) * time.Millisecond
-	usbMassStorage.SynchronizationMode = synchronization
+	usbMassStorage.SynchronizationMode = DiskImageSynchronizationMode(synchronization)
 
 	return usbMassStorage, nil
 }
@@ -1013,10 +1023,13 @@ func (dev *USBMassStorage) Validate() error {
 		return fmt.Errorf("usb-mass-storage devices need exactly one of 'path' or 'uri'")
 	}
 	if hasPath {
-		if dev.Timeout != 0 || dev.SynchronizationMode != "" {
+		if dev.Timeout != 0 {
 			return fmt.Errorf("usb-mass-storage NBD options require 'uri'")
 		}
-		return nil
+		return dev.DiskStorageConfig.validate()
+	}
+	if dev.CachingMode != "" {
+		return fmt.Errorf("usb-mass-storage 'cache' is not supported with 'uri'")
 	}
 	if dev.Type != DiskBackendDefault {
 		return fmt.Errorf("usb-mass-storage 'type' is not supported with 'uri'")
@@ -1027,14 +1040,8 @@ func (dev *USBMassStorage) Validate() error {
 	if dev.Timeout <= 0 {
 		return fmt.Errorf("usb-mass-storage NBD 'timeout' must be greater than zero")
 	}
-	if dev.SynchronizationMode != SynchronizationFullMode &&
-		dev.SynchronizationMode != SynchronizationNoneMode {
-		return fmt.Errorf(
-			"invalid sync mode: %s, must be 'full' or 'none'",
-			dev.SynchronizationMode,
-		)
-	}
-	return nil
+	_, err := ParseNBDSynchronizationMode(string(dev.SynchronizationMode))
+	return err
 }
 
 func (dev *USBMassStorage) ToCmdLine() ([]string, error) {
@@ -1058,55 +1065,36 @@ func (dev *USBMassStorage) ToCmdLine() ([]string, error) {
 }
 
 func (dev *USBMassStorage) FromOptions(options []option) error {
-	nbdOption := false
-	timeoutOption := false
-	for _, option := range options {
-		switch option.key {
-		case "path":
-			dev.ImagePath = option.value
-		case "type":
-			typ := DiskBackendType(option.value)
-			if !typ.IsValid() {
-				return fmt.Errorf("unexpected value for disk 'type' option: %s", option.value)
-			}
-			dev.Type = typ
+	var diskOptions []option
+	timeoutSet := false
+	for _, opt := range options {
+		switch opt.key {
 		case "uri":
-			dev.URI = option.value
-			nbdOption = true
+			if opt.value == "" {
+				return fmt.Errorf("empty USB mass-storage NBD 'uri'")
+			}
+			dev.URI = opt.value
 		case "timeout":
-			timeoutMS, err := strconv.ParseInt(option.value, 10, 32)
+			timeoutMS, err := strconv.ParseInt(opt.value, 10, 32)
 			if err != nil {
 				return err
 			}
 			dev.Timeout = time.Duration(timeoutMS) * time.Millisecond
-			nbdOption = true
-			timeoutOption = true
-		case "sync":
-			mode, err := ParseNBDSynchronizationMode(option.value)
-			if err != nil {
-				return err
-			}
-			dev.SynchronizationMode = mode
-			nbdOption = true
-		case "readonly":
-			if option.value != "" {
-				return fmt.Errorf(
-					"unexpected value for usb-mass-storage 'readonly' option: %s",
-					option.value,
-				)
-			}
-			dev.ReadOnly = true
+			timeoutSet = true
 		default:
-			return fmt.Errorf("unknown option for usb-mass-storage devices: %s", option.key)
+			diskOptions = append(diskOptions, opt)
 		}
 	}
-	if nbdOption {
-		if !timeoutOption {
+	if dev.URI != "" {
+		dev.SynchronizationMode = SyncModeFull
+		if !timeoutSet {
 			dev.Timeout = DefaultNBDTimeout
 		}
-		if dev.SynchronizationMode == "" {
-			dev.SynchronizationMode = SynchronizationFullMode
-		}
+	} else if timeoutSet {
+		return fmt.Errorf("usb-mass-storage NBD options require 'uri'")
+	}
+	if err := dev.DiskStorageConfig.FromOptions(diskOptions); err != nil {
+		return err
 	}
 	return dev.Validate()
 }
@@ -1143,10 +1131,57 @@ func (typ DiskBackendType) IsValid() bool {
 	}
 }
 
+// DiskImageCachingMode describes the disk image caching mode.
+// See: https://developer.apple.com/documentation/virtualization/vzdiskimagecachingmode
+type DiskImageCachingMode string
+
+const (
+	// CachingModeAutomatic allows the virtualization framework to automatically
+	// determine whether to enable data caching.
+	CachingModeAutomatic DiskImageCachingMode = "automatic"
+	// CachingModeCached enables data caching.
+	CachingModeCached DiskImageCachingMode = "cached"
+	// CachingModeUncached disables data caching.
+	CachingModeUncached DiskImageCachingMode = "uncached"
+)
+
+func (mode DiskImageCachingMode) IsValid() bool {
+	switch mode {
+	case CachingModeAutomatic, CachingModeCached, CachingModeUncached, "":
+		return true
+	default:
+		return false
+	}
+}
+
+// DiskImageSynchronizationMode describes the disk image synchronization mode.
+// See: https://developer.apple.com/documentation/virtualization/vzdiskimagesynchronizationmode
+type DiskImageSynchronizationMode string
+
+const (
+	// SyncModeFull synchronizes data to the permanent storage holding the disk image.
+	SyncModeFull DiskImageSynchronizationMode = "full"
+	// SyncModeFsync synchronizes data to the drive using the system's best-effort synchronization mode.
+	SyncModeFsync DiskImageSynchronizationMode = "fsync"
+	// SyncModeNone disables data synchronization with the permanent storage.
+	SyncModeNone DiskImageSynchronizationMode = "none"
+)
+
+func (mode DiskImageSynchronizationMode) IsValid() bool {
+	switch mode {
+	case SyncModeFull, SyncModeFsync, SyncModeNone, "":
+		return true
+	default:
+		return false
+	}
+}
+
 type DiskStorageConfig struct {
 	StorageConfig
-	ImagePath string          `json:"imagePath,omitempty"`
-	Type      DiskBackendType `json:"type,omitempty"`
+	ImagePath           string                       `json:"imagePath,omitempty"`
+	Type                DiskBackendType              `json:"type,omitempty"`
+	CachingMode         DiskImageCachingMode         `json:"cachingMode,omitempty"`
+	SynchronizationMode DiskImageSynchronizationMode `json:"synchronizationMode,omitempty"`
 }
 
 type NetworkBlockStorageConfig struct {
@@ -1168,6 +1203,15 @@ func (config *DiskStorageConfig) ToCmdLine() ([]string, error) {
 	if config.ReadOnly {
 		value += ",readonly"
 	}
+
+	if config.CachingMode != "" {
+		value += fmt.Sprintf(",cache=%s", string(config.CachingMode))
+	}
+
+	if config.SynchronizationMode != "" {
+		value += fmt.Sprintf(",sync=%s", string(config.SynchronizationMode))
+	}
+
 	return []string{"--device", value}, nil
 }
 
@@ -1187,8 +1231,35 @@ func (config *DiskStorageConfig) FromOptions(options []option) error {
 				return fmt.Errorf("unexpected value for virtio-blk 'readonly' option: %s", option.value)
 			}
 			config.ReadOnly = true
+		case "cache":
+			mode := DiskImageCachingMode(option.value)
+			if !mode.IsValid() {
+				return fmt.Errorf("unexpected value for disk 'cache' option: %s (valid values: automatic, cached, uncached)", option.value)
+			}
+			config.CachingMode = mode
+		case "sync":
+			mode := DiskImageSynchronizationMode(option.value)
+			if !mode.IsValid() {
+				return fmt.Errorf("unexpected value for disk 'sync' option: %s (valid values: full, fsync, none)", option.value)
+			}
+			config.SynchronizationMode = mode
 		default:
 			return fmt.Errorf("unknown option for %s devices: %s", config.DevName, option.key)
+		}
+	}
+	return config.validate()
+}
+
+func (config *DiskStorageConfig) validate() error {
+	// Validate options for block devices (type=dev)
+	if config.Type == DiskBackendBlockDevice {
+		// Cache mode is not supported for block devices
+		if config.CachingMode != "" {
+			return fmt.Errorf("cache mode is not supported for block devices (type=dev)")
+		}
+		// Block devices only support 'full' and 'none' sync modes, not 'fsync'
+		if config.SynchronizationMode == SyncModeFsync {
+			return fmt.Errorf("sync mode 'fsync' is not supported for block devices (type=dev), use 'full' or 'none'")
 		}
 	}
 	return nil
